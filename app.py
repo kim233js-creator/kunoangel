@@ -1,3 +1,35 @@
+import json, sqlite3, datetime, pathlib, zipfile, io, html, sys, threading, webbrowser
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
+ROOT=pathlib.Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
+DB=ROOT/'universe.db'
+SCHEMA='''
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS saves(id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS teams(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), name TEXT NOT NULL, UNIQUE(save_id,name));
+CREATE TABLE IF NOT EXISTS players(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), external_id TEXT, name TEXT NOT NULL, birthdate TEXT, bats TEXT, throws TEXT, position TEXT, UNIQUE(save_id,external_id));
+CREATE TABLE IF NOT EXISTS roster_moves(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), player_id INTEGER NOT NULL REFERENCES players(id), team_id INTEGER REFERENCES teams(id), effective_date TEXT NOT NULL, move_type TEXT NOT NULL, from_level TEXT, to_level TEXT, note TEXT, source TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS games(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), external_id TEXT, game_date TEXT NOT NULL, away_team_id INTEGER NOT NULL REFERENCES teams(id), home_team_id INTEGER NOT NULL REFERENCES teams(id), away_runs INTEGER NOT NULL, home_runs INTEGER NOT NULL, away_hits INTEGER, home_hits INTEGER, away_errors INTEGER, home_errors INTEGER, innings_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'final', source TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(save_id,external_id), CHECK(away_runs>=0 AND home_runs>=0));
+CREATE TABLE IF NOT EXISTS performances(id INTEGER PRIMARY KEY, game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE, player_id INTEGER NOT NULL REFERENCES players(id), team_id INTEGER NOT NULL REFERENCES teams(id), role TEXT NOT NULL, stats_json TEXT NOT NULL, UNIQUE(game_id,player_id,role));
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), event_date TEXT NOT NULL, event_type TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'C', headline TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', fact_status TEXT NOT NULL DEFAULT 'confirmed', source TEXT NOT NULL DEFAULT 'user', game_id INTEGER REFERENCES games(id), player_id INTEGER REFERENCES players(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS stories(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), event_id INTEGER REFERENCES events(id), game_id INTEGER REFERENCES games(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, story_type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, fictional INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS settings(save_id INTEGER PRIMARY KEY REFERENCES saves(id), rules_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS imports(id INTEGER PRIMARY KEY, save_id INTEGER NOT NULL REFERENCES saves(id), content_hash TEXT NOT NULL, imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(save_id,content_hash));
+CREATE INDEX IF NOT EXISTS idx_games_date ON games(save_id,game_date);
+CREATE INDEX IF NOT EXISTS idx_events_date ON events(save_id,event_date);
+'''
+DEFAULT_RULES={'universe':'KBO UNIVERSE 2.0','source_of_truth':'Only user-provided OOTP data establishes factual results','tracked_team':'KIA 타이거즈','grades':{'S':'우승·대형 트레이드·리그 충격','A':'라이벌전·대기록·주축 부상','B':'유망주 데뷔·연승/연패','C':'일반 경기'},'article_order':['스코어보드','경기 흐름','선수 활약','가상 인터뷰','KIA 갤러리 반응'],'fiction_label':'가상 인터뷰 및 팬 반응','no_invented_stats':True}
+def connect():
+ c=sqlite3.connect(DB); c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON');return c
+def initialize():
+ with connect() as c:
+  c.executescript(SCHEMA)
+  if not c.execute('SELECT 1 FROM saves').fetchone():
+   c.execute('INSERT INTO saves(name) VALUES(?)',('새로운 KBO 세이브',))
+   sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+   c.execute('INSERT INTO settings(save_id,rules_json) VALUES(?,?)',(sid,json.dumps(DEFAULT_RULES,ensure_ascii=False)))
+def json_response(handler,status,data,ctype='application/json; charset=utf-8'):
+ body=json.dumps(data,ensure_ascii=False).encode() if not isinstance(data,bytes) else data
  handler.send_response(status);handler.send_header('Content-Type',ctype);handler.send_header('Content-Length',str(len(body)));handler.send_header('Cache-Control','no-store');handler.end_headers();handler.wfile.write(body)
 def ensure_team(c,sid,name):
  c.execute('INSERT OR IGNORE INTO teams(save_id,name) VALUES(?,?)',(sid,name));return c.execute('SELECT id FROM teams WHERE save_id=? AND name=?',(sid,name)).fetchone()['id']
@@ -62,3 +94,58 @@ class Handler(BaseHTTPRequestHandler):
      return json_response(self,200,{'text':'\n'.join(lines)})
    return json_response(self,404,{'error':'경로 없음'})
   except Exception as e:return json_response(self,400,{'error':str(e)})
+ def do_POST(self):
+  try:
+   size=int(self.headers.get('Content-Length','0'))
+   if size>8_000_000:raise ValueError('최대 8MB')
+   d=json.loads(self.rfile.read(size));p=urlparse(self.path).path
+   with connect() as c:
+    if p=='/api/saves':
+     name=str(d['name']).strip();assert name
+     c.execute('INSERT INTO saves(name) VALUES(?)',(name,));sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+     c.execute('INSERT INTO settings VALUES(?,?)',(sid,json.dumps(DEFAULT_RULES,ensure_ascii=False)))
+     return json_response(self,200,{'id':sid})
+    if p=='/api/restore':return json_response(self,200,{'id':restore(c,d)})
+    sid=int(d['save_id'])
+    if not c.execute('SELECT 1 FROM saves WHERE id=?',(sid,)).fetchone():raise ValueError('세이브 없음')
+    if p=='/api/games':
+     validate_date(d['game_date']);away=str(d['away']).strip();home=str(d['home']).strip()
+     if not away or not home or away==home:raise ValueError('원정/홈 팀을 확인하세요')
+     ar=int(d['away_runs']);hr=int(d['home_runs']);assert ar>=0 and hr>=0
+     innings=d.get('innings',{})
+     if not isinstance(innings,dict):raise ValueError('이닝별 기록은 JSON 객체여야 합니다')
+     for k,score in [('away',ar),('home',hr)]:
+      if k in innings and (not isinstance(innings[k],list) or any(type(n)!=int or n<0 for n in innings[k]) or sum(innings[k])!=score):raise ValueError(k+' 이닝별 득점 합계 불일치')
+     ext=d.get('external_id')
+     if ext is not None:ext=str(ext).strip() or None
+     if ext and c.execute('SELECT 1 FROM games WHERE save_id=? AND external_id=?',(sid,ext)).fetchone():raise ValueError('이미 저장된 OOTP 경기 ID입니다')
+     c.execute('INSERT INTO games(save_id,external_id,game_date,away_team_id,home_team_id,away_runs,home_runs,innings_json) VALUES(?,?,?,?,?,?,?,?)',(sid,ext,d['game_date'],ensure_team(c,sid,away),ensure_team(c,sid,home),ar,hr,json.dumps(innings,ensure_ascii=False)))
+    elif p=='/api/events':
+     validate_date(d['event_date']);assert d['importance'] in 'SABC';assert str(d['headline']).strip()
+     c.execute('INSERT INTO events(save_id,event_date,event_type,importance,headline,detail) VALUES(?,?,?,?,?,?)',(sid,d['event_date'],d['event_type'],d['importance'],d['headline'],d.get('detail','')))
+    elif p=='/api/stories':
+     title=str(d.get('title','')).strip();body=str(d.get('body','')).strip()
+     if not title or not body:raise ValueError('제목과 본문을 입력하세요')
+     c.execute('INSERT INTO stories(save_id,story_type,title,body,fictional) VALUES(?,?,?,?,1)',(sid,str(d.get('story_type','기타')),title,body))
+    elif p=='/api/roster':
+     validate_date(d['effective_date']);assert str(d['name']).strip()
+     pid=ensure_player(c,sid,d['name'].strip());tid=ensure_team(c,sid,d['team'].strip()) if d.get('team','').strip() else None
+     c.execute('INSERT INTO roster_moves(save_id,player_id,team_id,effective_date,move_type,note) VALUES(?,?,?,?,?,?)',(sid,pid,tid,d['effective_date'],d['move_type'],d.get('note','')))
+    else:return json_response(self,404,{'error':'경로 없음'})
+    return json_response(self,200,{'ok':True})
+  except Exception as e:return json_response(self,400,{'error':str(e)})
+if __name__=='__main__':
+ initialize()
+ try:
+  server=ThreadingHTTPServer(('127.0.0.1',8765),Handler)
+ except OSError as exc:
+  print('서버 시작 실패: 포트 8765를 확인하세요.', exc)
+  input('종료하려면 Enter를 누르세요...')
+  sys.exit(1)
+ url='http://127.0.0.1:8765'
+ print('KBO UNIVERSE 실행 중:',url,flush=True)
+ print('이 창을 닫으면 프로그램이 종료됩니다.',flush=True)
+ threading.Timer(0.8,lambda:webbrowser.open(url)).start()
+ try:server.serve_forever()
+ except KeyboardInterrupt:pass
+ finally:server.server_close()
